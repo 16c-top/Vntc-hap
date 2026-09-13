@@ -1,7 +1,8 @@
 import { VpnExtensionAbility, vpnExtension } from '@kit.NetworkKit';
-import { common, Want } from '@kit.AbilityKit';
+import { common, Want, wantAgent } from '@kit.AbilityKit';
 import { BusinessError, commonEventManager } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { notificationManager } from '@kit.NotificationKit';
 import vntNapi from 'libvnt_napi.so';
 import { VPN_STATUS_EVENT } from './VpnConst';
 
@@ -10,6 +11,8 @@ const TAG: string = 'VntVpnAbility';
 const BUNDLE_NAME: string = 'top.16c.vntc';
 const DEFAULT_MTU: number = 1400;
 const HEARTBEAT_MS: number = 2000;
+const NOTIFY_ID: number = 100;
+const NOTIFY_REFRESH_MS: number = 10000;
 
 interface VpnParams {
   server: string;
@@ -39,6 +42,10 @@ export default class VntVpnAbility extends VpnExtensionAbility {
   private params: VpnParams | undefined = undefined;
   private routesApplied: boolean = false;
   private rebuilding: boolean = false;
+  private suppressStatus: boolean = false;
+  private startAt: number = 0;
+  private lastNotify: number = 0;
+  private launchAgent: object | undefined = undefined;
 
   onCreate(want: Want): void {
     this.setupVpn(want);
@@ -51,8 +58,10 @@ export default class VntVpnAbility extends VpnExtensionAbility {
     }
     vntNapi.setEventListener(null);
     vntNapi.stop();
+    this.suppressStatus = false;
     this.eventText = '连接已断开';
     this.publishStatus();
+    this.cancelKeepAliveNotification();
     this.teardown();
   }
 
@@ -60,46 +69,58 @@ export default class VntVpnAbility extends VpnExtensionAbility {
     try {
       const params: VpnParams = this.readParams(want);
       this.params = params;
-      const tunIp: string = params.virtualIp;
-      const conn: vpnExtension.VpnConnection =
-        vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext);
-      this.vpnConnection = conn;
-
-      const cfg: vpnExtension.VpnConfig = {
-        addresses: [{
-          address: { address: tunIp, family: 1 },
-          prefixLength: 24
-        }],
-        mtu: params.mtu,
-        isIPv4Accepted: true,
-        dnsAddresses: ['223.5.5.5', '114.114.114.114'],
-        blockedApplications: [BUNDLE_NAME]
-      };
-
-      const tunFd: number = await conn.create(cfg);
-      hilog.info(DOMAIN, TAG, 'tun fd: %{public}d', tunFd);
 
       vntNapi.setEventListener((event: number, json: string): void => {
         this.onVntEvent(event, json);
       });
 
-      const ok: boolean = vntNapi.start(tunFd, params.token, params.deviceId, params.name,
-        params.server, params.password, tunIp, params.mtu, params.useChannel,
+      hilog.info(DOMAIN, TAG, 'phase 1: start vnt without tun to learn gateway');
+      let ok: boolean = vntNapi.start(-1, params.token, params.deviceId, params.name,
+        params.server, params.password, params.virtualIp, params.mtu, params.useChannel,
         params.stunServers, params.nameServers, params.ports, params.cipherModel,
         params.compressor, params.serverEncrypt, params.finger, params.enableTraffic);
+      if (!ok) {
+        hilog.warn(DOMAIN, TAG, 'start without tun failed: %{public}s, fallback to placeholder tun',
+          vntNapi.lastError());
+        const tunIp: string = params.virtualIp;
+        const conn: vpnExtension.VpnConnection =
+          vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext);
+        this.vpnConnection = conn;
+        const cfg: vpnExtension.VpnConfig = {
+          addresses: [{
+            address: { address: tunIp, family: 1 },
+            prefixLength: 24
+          }],
+          mtu: params.mtu,
+          isIPv4Accepted: true,
+          dnsAddresses: ['223.5.5.5', '114.114.114.114'],
+          blockedApplications: [BUNDLE_NAME]
+        };
+        const tunFd: number = await conn.create(cfg);
+        hilog.info(DOMAIN, TAG, 'tun fd: %{public}d', tunFd);
+        ok = vntNapi.start(tunFd, params.token, params.deviceId, params.name,
+          params.server, params.password, tunIp, params.mtu, params.useChannel,
+          params.stunServers, params.nameServers, params.ports, params.cipherModel,
+          params.compressor, params.serverEncrypt, params.finger, params.enableTraffic);
+      }
       if (!ok) {
         this.lastError = vntNapi.lastError();
         hilog.error(DOMAIN, TAG, 'vnt start failed: %{public}s', this.lastError);
         vntNapi.setEventListener(null);
+        this.suppressStatus = false;
         this.eventText = 'vnt 启动失败';
         this.publishStatus();
         this.teardown();
         return;
       }
       hilog.info(DOMAIN, TAG, 'vnt started');
+      this.suppressStatus = true;
+      this.startAt = Date.now();
+      this.updateKeepAliveNotification(true);
 
       this.heartbeatId = setInterval((): void => {
         this.publishStatus();
+        this.updateKeepAliveNotification(false);
       }, HEARTBEAT_MS);
       this.publishStatus();
     } catch (e) {
@@ -293,6 +314,7 @@ export default class VntVpnAbility extends VpnExtensionAbility {
       hilog.error(DOMAIN, TAG, 'rebuild vpn error: %{public}s', JSON.stringify(e) ?? '');
     }
     this.rebuilding = false;
+    this.suppressStatus = false;
     this.publishStatus();
   }
 
@@ -398,6 +420,9 @@ export default class VntVpnAbility extends VpnExtensionAbility {
   }
 
   private publishStatus(): void {
+    if (this.rebuilding || this.suppressStatus) {
+      return;
+    }
     let payload: Record<string, Object> = {};
     try {
       payload = JSON.parse(vntNapi.status()) as Record<string, Object>;
@@ -418,11 +443,89 @@ export default class VntVpnAbility extends VpnExtensionAbility {
     }
     payload['event_text'] = this.eventText;
     payload['error'] = this.lastError;
+    payload['start_at'] = this.startAt;
     const pubData: commonEventManager.CommonEventPublishData = { data: JSON.stringify(payload) };
     commonEventManager.publish(VPN_STATUS_EVENT, pubData, (err: BusinessError): void => {
       if (err) {
         hilog.error(DOMAIN, TAG, 'publish status failed: %{public}s', err.message ?? '');
       }
+    });
+  }
+
+  private formatElapsed(ms: number): string {
+    const totalSec: number = Math.floor(ms / 1000);
+    const h: number = Math.floor(totalSec / 3600);
+    const m: number = Math.floor((totalSec % 3600) / 60);
+    const s: number = totalSec % 60;
+    const mm: string = m < 10 ? `0${m}` : `${m}`;
+    const ss: string = s < 10 ? `0${s}` : `${s}`;
+    if (h > 0) {
+      const hh: string = h < 10 ? `0${h}` : `${h}`;
+      return `${hh}:${mm}:${ss}`;
+    }
+    return `${mm}:${ss}`;
+  }
+
+  private updateKeepAliveNotification(force: boolean): void {
+    if (this.startAt === 0) {
+      return;
+    }
+    const now: number = Date.now();
+    if (!force && now - this.lastNotify < NOTIFY_REFRESH_MS) {
+      return;
+    }
+    this.lastNotify = now;
+    if (this.launchAgent === undefined) {
+      const wantObj: Want = {
+        deviceId: '',
+        bundleName: BUNDLE_NAME,
+        abilityName: 'EntryAbility',
+        action: 'action.system.home'
+      };
+      const agentInfo: wantAgent.WantAgentInfo = {
+        wants: [wantObj],
+        actionType: wantAgent.OperationType.START_ABILITY,
+        requestCode: 0,
+        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+      };
+      wantAgent.getWantAgent(agentInfo).then((agent: object): void => {
+        this.launchAgent = agent;
+        this.doPublishNotification();
+      }).catch((err: BusinessError): void => {
+        hilog.error(DOMAIN, TAG, 'getWantAgent failed: %{public}s', err.message ?? '');
+        this.doPublishNotification();
+      });
+      return;
+    }
+    this.doPublishNotification();
+  }
+
+  private doPublishNotification(): void {
+    if (this.startAt === 0) {
+      return;
+    }
+    const elapsed: string = this.formatElapsed(Date.now() - this.startAt);
+    const request: notificationManager.NotificationRequest = {
+      id: NOTIFY_ID,
+      wantAgent: this.launchAgent,
+      content: {
+        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
+        normal: {
+          title: 'Vntc 正在运行',
+          text: `VPN 组网已保持 ${elapsed}`,
+          additionalText: '虚拟网络服务运行中'
+        }
+      }
+    };
+    notificationManager.publish(request).catch((err: BusinessError): void => {
+      hilog.error(DOMAIN, TAG, 'publish notification failed: %{public}s', err.message ?? '');
+    });
+  }
+
+  private cancelKeepAliveNotification(): void {
+    this.startAt = 0;
+    notificationManager.cancel(NOTIFY_ID).catch((err: BusinessError): void => {
+      hilog.error(DOMAIN, TAG, 'cancel notification failed: %{public}s', err.message ?? '');
     });
   }
 

@@ -1,6 +1,8 @@
 #include "napi/native_api.h"
 #include <hilog/log.h>
 #include <string>
+#include <sys/socket.h>
+#include <unistd.h>
 #include "vnt_ffi.h"
 
 namespace {
@@ -9,11 +11,25 @@ constexpr const char *VNT_LOG_TAG = "vnt_ffi";
 
 VntHandle *g_handle = nullptr;
 napi_threadsafe_function g_event_tsfn = nullptr;
+int g_dummyTunFd = -1;
+int g_dummyPeerFd = -1;
 
 struct EventPayload {
   int event;
   std::string json;
 };
+
+static void CloseDummyTun()
+{
+    if (g_dummyTunFd >= 0) {
+        close(g_dummyTunFd);
+        g_dummyTunFd = -1;
+    }
+    if (g_dummyPeerFd >= 0) {
+        close(g_dummyPeerFd);
+        g_dummyPeerFd = -1;
+    }
+}
 
 std::string NapiGetString(napi_env env, napi_value value)
 {
@@ -134,6 +150,15 @@ napi_value Start(napi_env env, napi_callback_info info)
         vnt_free(g_handle);
         g_handle = nullptr;
     }
+    CloseDummyTun();
+    if (tunFd < 0) {
+        int sv[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0) {
+            g_dummyTunFd = sv[0];
+            g_dummyPeerFd = sv[1];
+            tunFd = sv[0];
+        }
+    }
     vnt_init();
     vnt_set_log_callback(NativeLogCb, nullptr);
 
@@ -169,6 +194,7 @@ napi_value Stop(napi_env env, napi_callback_info info)
         vnt_free(g_handle);
         g_handle = nullptr;
     }
+    CloseDummyTun();
     napi_value result = nullptr;
     napi_get_boolean(env, true, &result);
     return result;

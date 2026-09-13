@@ -368,6 +368,8 @@ struct Index {
   @State lastEvent: string = '';
   @State errMsg: string = '';
   @State devices: Array<Record<string, Object>> = [];
+  @State connectStart: number = 0;
+  @State runElapsed: number = 0;
 
   @State dlgTitle: string = '新增配置';
   @State dlgName: string = '';
@@ -431,7 +433,10 @@ struct Index {
       });
     this.timerId = setInterval((): void => {
       this.checkHeartbeat();
-    }, 2000);
+      if (this.connectStart > 0 && this.running) {
+        this.runElapsed = Date.now() - this.connectStart;
+      }
+    }, 1000);
   }
 
   aboutToDisappear(): void {
@@ -457,7 +462,16 @@ struct Index {
     } catch (e) {
       return;
     }
-    this.running = payload['running'] === true;
+    const isRunning: boolean = payload['running'] === true;
+    const startAtVal: Object | undefined = payload['start_at'];
+    if (isRunning && typeof startAtVal === 'number' && startAtVal > 0) {
+      this.connectStart = startAtVal;
+      this.runElapsed = Date.now() - startAtVal;
+    } else {
+      this.connectStart = 0;
+      this.runElapsed = 0;
+    }
+    this.running = isRunning;
     this.online = payload['online'] === true;
     this.currentIp = `${payload['virtual_ip'] ?? ''}`;
     const gwVal: Object | undefined = payload['gateway'];
@@ -489,6 +503,8 @@ struct Index {
     if (Date.now() - this.lastBeat > HEARTBEAT_TIMEOUT_MS) {
       this.running = false;
       this.online = false;
+      this.connectStart = 0;
+      this.runElapsed = 0;
       this.currentIp = '';
       this.gateway = '';
       this.channel = '';
@@ -560,6 +576,20 @@ struct Index {
     const c: number = Math.floor(Math.random() * 0x10000);
     const d: number = Math.floor(Math.random() * 0x10000);
     return `phone-${this.hex4(a)}${this.hex4(b)}${this.hex4(c)}${this.hex4(d)}`;
+  }
+
+  private formatElapsed(ms: number): string {
+    const totalSec: number = Math.floor(ms / 1000);
+    const h: number = Math.floor(totalSec / 3600);
+    const m: number = Math.floor((totalSec % 3600) / 60);
+    const s: number = totalSec % 60;
+    const mm: string = m < 10 ? `0${m}` : `${m}`;
+    const ss: string = s < 10 ? `0${s}` : `${s}`;
+    if (h > 0) {
+      const hh: string = h < 10 ? `0${h}` : `${h}`;
+      return `${hh}:${mm}:${ss}`;
+    }
+    return `${mm}:${ss}`;
   }
 
   private formatBytes(bytes: number): string {
@@ -784,6 +814,8 @@ struct Index {
     vpnExtension.stopVpnExtensionAbility(want).then((): void => {
       this.running = false;
       this.online = false;
+      this.connectStart = 0;
+      this.runElapsed = 0;
       this.currentIp = '';
       this.gateway = '';
       this.channel = '';
@@ -924,7 +956,7 @@ struct Index {
                 Column()
                   .layoutWeight(1)
 
-                Text(this.running ? '运行中' : '已停止')
+                Text(this.running ? `运行中 ${this.formatElapsed(this.runElapsed)}` : '已停止')
                   .fontSize(12)
                   .fontColor('#FFFFFF')
                   .padding({ left: 12, right: 12, top: 6, bottom: 6 })

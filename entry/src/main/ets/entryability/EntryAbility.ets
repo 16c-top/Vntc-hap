@@ -2,6 +2,7 @@ import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.Ab
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { notificationManager } from '@kit.NotificationKit';
 
 const DOMAIN = 0x0000;
 
@@ -24,6 +25,10 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
+      notificationManager.requestEnableNotification(this.context).catch((err: BusinessError): void => {
+        hilog.warn(DOMAIN, 'testTag', 'request notification enable failed %{public}d: %{public}s',
+          err.code ?? 0, err.message ?? '');
+      });
     });
 
     try {

@@ -1,8 +1,8 @@
 {
   "app": {
     "bundleName": "top.16c.vntc",
-    "vendor": "example",
-    "versionCode": 1000000,
+    "vendor": "Young",
+    "versionCode": 1000002,
     "versionName": "1.0.0",
     "buildVersion": "1",
     "icon": "$media:layered_image",
