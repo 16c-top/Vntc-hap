@@ -15,6 +15,7 @@ const NOTIFY_ID: number = 100;
 const NOTIFY_REFRESH_MS: number = 10000;
 
 interface VpnParams {
+  coreVersion: string;
   server: string;
   token: string;
   password: string;
@@ -26,6 +27,9 @@ interface VpnParams {
   stunServers: string;
   nameServers: string;
   ports: string;
+  inIps: string;
+  outIps: string;
+  mapping: string;
   cipherModel: number;
   compressor: number;
   serverEncrypt: number;
@@ -59,10 +63,81 @@ export default class VntVpnAbility extends VpnExtensionAbility {
     vntNapi.setEventListener(null);
     vntNapi.stop();
     this.suppressStatus = false;
+    this.tunVirtualIp = '';
     this.eventText = '连接已断开';
     this.publishStatus();
     this.cancelKeepAliveNotification();
     this.teardown();
+  }
+
+  private failStart(eventText: string): void {
+    hilog.error(DOMAIN, TAG, 'setup vpn failed: %{public}s', this.lastError);
+    vntNapi.setEventListener(null);
+    this.suppressStatus = false;
+    this.eventText = eventText;
+    this.publishStatus();
+    this.teardown();
+  }
+
+  private buildV2Json(params: VpnParams, virtualIp: string): string {
+    const json: Record<string, Object> = {};
+    json['network_code'] = params.token;
+    json['server'] = params.server;
+    json['device_mode'] = 'tun';
+    if (params.deviceId !== '') {
+      json['device_id'] = params.deviceId;
+    }
+    if (params.name !== '') {
+      json['device_name'] = params.name;
+    }
+    if (params.password !== '') {
+      json['password'] = params.password;
+    }
+    if (virtualIp !== '') {
+      json['ip'] = virtualIp;
+    }
+    if (params.mtu > 0) {
+      json['mtu'] = params.mtu;
+    }
+    if (params.stunServers.trim() !== '') {
+      json['udp_stun'] = params.stunServers.trim();
+    }
+    if (params.inIps.trim() !== '') {
+      json['input'] = params.inIps.trim();
+    }
+    if (params.outIps.trim() !== '') {
+      json['output'] = params.outIps.trim();
+    }
+    if (params.mapping.trim() !== '') {
+      json['port_mapping'] = params.mapping.trim();
+    }
+    json['compress'] = params.compressor !== 0;
+    if (params.useChannel === 0) {
+      json['no_punch'] = true;
+    }
+    const portsRaw: string = params.ports.trim();
+    if (portsRaw !== '') {
+      const firstPort: number = Number(portsRaw.split(',')[0].trim());
+      if (Number.isFinite(firstPort) && firstPort > 0 && firstPort <= 65535) {
+        json['tunnel_port'] = firstPort;
+      }
+    }
+    return JSON.stringify(json);
+  }
+
+  private startCore(tunFd: number, virtualIp: string): Promise<boolean> {
+    const params: VpnParams | undefined = this.params;
+    if (params === undefined) {
+      return Promise.resolve(false);
+    }
+    if (params.coreVersion === 'v2') {
+      return vntNapi.startJson(tunFd, this.buildV2Json(params, virtualIp));
+    }
+    return vntNapi.start(tunFd, params.token, params.deviceId, params.name,
+      params.server, params.password, virtualIp, params.mtu, params.useChannel,
+      params.stunServers, params.nameServers, params.ports, params.cipherModel,
+      params.compressor, params.serverEncrypt, params.finger, params.enableTraffic,
+      params.inIps, params.outIps, params.mapping);
   }
 
   private async setupVpn(want: Want): Promise<void> {
@@ -70,26 +145,54 @@ export default class VntVpnAbility extends VpnExtensionAbility {
       const params: VpnParams = this.readParams(want);
       this.params = params;
 
+      if (params.coreVersion === 'v2') {
+        const sv: string = params.server.trim();
+        if (sv.startsWith('udp://') || sv.startsWith('ws://')) {
+          this.lastError = 'V2 内核不支持 udp:// 与明文 ws://';
+          this.failStart('服务端协议不受支持');
+          return;
+        }
+        if (sv.includes(',') && params.virtualIp.trim() === '') {
+          this.lastError = 'V2 多服务端地址必须指定固定虚拟 IP';
+          this.failStart('缺少固定虚拟 IP');
+          return;
+        }
+      }
+
       vntNapi.setEventListener((event: number, json: string): void => {
         this.onVntEvent(event, json);
       });
 
+      if (!vntNapi.setCoreVersion(params.coreVersion)) {
+        this.lastError = `内核 ${params.coreVersion} 加载失败：${vntNapi.lastError()}`;
+        this.failStart('内核加载失败');
+        return;
+      }
+
       hilog.info(DOMAIN, TAG, 'phase 1: start vnt without tun to learn gateway');
-      let ok: boolean = vntNapi.start(-1, params.token, params.deviceId, params.name,
-        params.server, params.password, params.virtualIp, params.mtu, params.useChannel,
-        params.stunServers, params.nameServers, params.ports, params.cipherModel,
-        params.compressor, params.serverEncrypt, params.finger, params.enableTraffic);
+      let ok: boolean = await this.startCore(-1, params.virtualIp);
       if (!ok) {
         hilog.warn(DOMAIN, TAG, 'start without tun failed: %{public}s, fallback to placeholder tun',
           vntNapi.lastError());
-        const tunIp: string = params.virtualIp;
+        const tunIp: string = this.resolveTunAddress(params.virtualIp);
+        if (tunIp === '') {
+          this.lastError = params.virtualIp.trim() === ''
+            ? '未能从服务端获取虚拟 IP，且未配置固定虚拟 IP：请在配置中填写"虚拟 IP"（如 10.26.0.5）后重试'
+            : `虚拟 IP 格式无效：${params.virtualIp}（应为 IPv4，可带前缀如 10.26.0.5/24）`;
+          hilog.error(DOMAIN, TAG, 'no usable virtual ip: %{public}s', params.virtualIp);
+          this.eventText = '缺少可用虚拟 IP';
+          this.suppressStatus = false;
+          this.publishStatus();
+          this.teardown();
+          return;
+        }
         const conn: vpnExtension.VpnConnection =
           vpnExtension.createVpnConnection(this.context as common.VpnExtensionContext);
         this.vpnConnection = conn;
         const cfg: vpnExtension.VpnConfig = {
           addresses: [{
             address: { address: tunIp, family: 1 },
-            prefixLength: 24
+            prefixLength: this.resolveTunPrefix(params.virtualIp)
           }],
           mtu: params.mtu,
           isIPv4Accepted: true,
@@ -98,10 +201,7 @@ export default class VntVpnAbility extends VpnExtensionAbility {
         };
         const tunFd: number = await conn.create(cfg);
         hilog.info(DOMAIN, TAG, 'tun fd: %{public}d', tunFd);
-        ok = vntNapi.start(tunFd, params.token, params.deviceId, params.name,
-          params.server, params.password, tunIp, params.mtu, params.useChannel,
-          params.stunServers, params.nameServers, params.ports, params.cipherModel,
-          params.compressor, params.serverEncrypt, params.finger, params.enableTraffic);
+        ok = await this.startCore(tunFd, tunIp);
       }
       if (!ok) {
         this.lastError = vntNapi.lastError();
@@ -209,6 +309,9 @@ export default class VntVpnAbility extends VpnExtensionAbility {
     if (code === 'Warn') {
       return '警告：部分功能异常，不阻塞运行';
     }
+    if (code === 'ERROR') {
+      return '内核报错';
+    }
     if (code === 'Unknown') {
       return '未知错误';
     }
@@ -287,31 +390,22 @@ export default class VntVpnAbility extends VpnExtensionAbility {
           address: { address: vip, family: 1 },
           prefixLength: prefix
         }],
-        routes: [{
-          interface: 'vpn-tun',
-          destination: { address: { address: network, family: 1 }, prefixLength: prefix },
-          gateway: { address: gateway, family: 1 },
-          hasGateway: true,
-          isDefaultRoute: false
-        }],
         mtu: params.mtu,
         isIPv4Accepted: true,
         dnsAddresses: ['223.5.5.5', '114.114.114.114'],
         blockedApplications: [BUNDLE_NAME]
       };
       const tunFd: number = await conn.create(cfg);
-      const ok: boolean = vntNapi.start(tunFd, params.token, params.deviceId, params.name,
-        params.server, params.password, vip, params.mtu, params.useChannel,
-        params.stunServers, params.nameServers, params.ports, params.cipherModel,
-        params.compressor, params.serverEncrypt, params.finger, params.enableTraffic);
+      const ok: boolean = await this.startCore(tunFd, vip);
       if (!ok) {
         this.lastError = vntNapi.lastError();
         this.eventText = '连接重建失败';
         hilog.error(DOMAIN, TAG, 'vnt restart failed: %{public}s', this.lastError);
       }
     } catch (e) {
+      this.lastError = JSON.stringify(e) ?? '';
       this.eventText = '连接重建失败';
-      hilog.error(DOMAIN, TAG, 'rebuild vpn error: %{public}s', JSON.stringify(e) ?? '');
+      hilog.error(DOMAIN, TAG, 'rebuild vpn error: %{public}s', this.lastError);
     }
     this.rebuilding = false;
     this.suppressStatus = false;
@@ -441,6 +535,16 @@ export default class VntVpnAbility extends VpnExtensionAbility {
       const empty: Array<Record<string, Object>> = [];
       payload['devices'] = empty;
     }
+    try {
+      payload['device_detail'] = JSON.parse(vntNapi.deviceDetail());
+    } catch (e) {
+      payload['device_detail'] = [];
+    }
+    try {
+      payload['route_table'] = JSON.parse(vntNapi.routeTable());
+    } catch (e) {
+      payload['route_table'] = [];
+    }
     payload['event_text'] = this.eventText;
     payload['error'] = this.lastError;
     payload['start_at'] = this.startAt;
@@ -529,6 +633,52 @@ export default class VntVpnAbility extends VpnExtensionAbility {
     });
   }
 
+  private isValidIpv4(text: string): boolean {
+    const parts: Array<string> = text.split('.');
+    if (parts.length !== 4) {
+      return false;
+    }
+    for (let i = 0; i < parts.length; i++) {
+      const seg: string = parts[i];
+      if (seg === '' || seg.length > 3) {
+        return false;
+      }
+      for (let j = 0; j < seg.length; j++) {
+        const ch: number = seg.charCodeAt(j);
+        if (ch < 48 || ch > 57) {
+          return false;
+        }
+      }
+      if (Number(seg) > 255) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private resolveTunAddress(virtualIp: string): string {
+    const raw: string = virtualIp.trim();
+    if (raw === '') {
+      return '';
+    }
+    const slash: number = raw.indexOf('/');
+    const addr: string = (slash >= 0 ? raw.substring(0, slash) : raw).trim();
+    return this.isValidIpv4(addr) ? addr : '';
+  }
+
+  private resolveTunPrefix(virtualIp: string): number {
+    const raw: string = virtualIp.trim();
+    const slash: number = raw.indexOf('/');
+    if (slash < 0) {
+      return 24;
+    }
+    const val: number = Number(raw.substring(slash + 1).trim());
+    if (!Number.isFinite(val) || val <= 0 || val > 32) {
+      return 24;
+    }
+    return val;
+  }
+
   private teardown(): void {
     if (this.vpnConnection !== undefined) {
       this.vpnConnection.destroy().then((): void => {
@@ -552,7 +702,9 @@ export default class VntVpnAbility extends VpnExtensionAbility {
     const seVal: Object | undefined = params['serverEncrypt'];
     const fiVal: Object | undefined = params['finger'];
     const trVal: Object | undefined = params['enableTraffic'];
+    const coreV2: boolean = this.paramStr(params, 'coreVersion') === 'v2';
     const vntParams: VpnParams = {
+      coreVersion: coreV2 ? 'v2' : 'v1',
       server: this.paramStr(params, 'server'),
       token: this.paramStr(params, 'token'),
       password: this.paramStr(params, 'password'),
@@ -564,8 +716,11 @@ export default class VntVpnAbility extends VpnExtensionAbility {
       stunServers: this.paramStr(params, 'stunServers'),
       nameServers: this.paramStr(params, 'nameServers'),
       ports: this.paramStr(params, 'ports'),
+      inIps: this.paramStr(params, 'inIps'),
+      outIps: this.paramStr(params, 'outIps'),
+      mapping: this.paramStr(params, 'mapping'),
       cipherModel: (typeof ciVal === 'number' && ciVal >= 0 && ciVal <= 6) ? ciVal : 0,
-      compressor: (typeof coVal === 'number' && coVal >= 0 && coVal <= 1) ? coVal : 1,
+      compressor: (typeof coVal === 'number' && coVal >= 0 && coVal <= 2) ? coVal : (coreV2 ? 0 : 1),
       serverEncrypt: (typeof seVal === 'boolean') ? (seVal ? 1 : 0) : 1,
       finger: (typeof fiVal === 'boolean') ? (fiVal ? 1 : 0) : 1,
       enableTraffic: (typeof trVal === 'boolean') ? (trVal ? 1 : 0) : 1

@@ -5,6 +5,7 @@ import { VpnConfigItem } from './VpnConfigItem';
 const STORE_NAME: string = 'vnt_configs';
 const KEY_CONFIGS: string = 'configs';
 const KEY_SELECTED: string = 'selected';
+const KEY_CORE_VERSION: string = 'coreVersion';
 
 export class ConfigStore {
   private prefs: preferences.Preferences | undefined = undefined;
@@ -64,6 +65,31 @@ export class ConfigStore {
     }
     try {
       this.prefs.putSync(KEY_SELECTED, id);
+      await this.prefs.flush();
+    } catch (e) {
+    }
+  }
+
+  async loadCoreVersion(): Promise<string> {
+    if (this.prefs === undefined) {
+      return 'v1';
+    }
+    try {
+      const raw: preferences.ValueType = this.prefs.getSync(KEY_CORE_VERSION, 'v1');
+      if (raw === 'v2') {
+        return 'v2';
+      }
+    } catch (e) {
+    }
+    return 'v1';
+  }
+
+  async saveCoreVersion(version: string): Promise<void> {
+    if (this.prefs === undefined) {
+      return;
+    }
+    try {
+      this.prefs.putSync(KEY_CORE_VERSION, version);
       await this.prefs.flush();
     } catch (e) {
     }

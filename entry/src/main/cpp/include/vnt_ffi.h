@@ -53,9 +53,11 @@ extern "C" {
 #define VNT_CHANNEL_P2P   1 /* 仅点对点 */
 #define VNT_CHANNEL_ALL   2 /* 自动（推荐） */
 
-/* 压缩算法（VntConfig.compressor） */
+/* 压缩算法（VntConfig.compressor）
+ * 0 = 不压缩；1 = lz4；2 = zstd（固定压缩等级 9） */
 #define VNT_COMPRESS_NONE 0
 #define VNT_COMPRESS_LZ4  1
+#define VNT_COMPRESS_ZSTD 2
 
 /* ---------------- 回调 ---------------- */
 
@@ -89,8 +91,10 @@ typedef struct {
     /* 可选：指定本地端口，逗号分隔，如 35535,35536 */
     const char *ports;
 
-    /* 可选：入站路由（本端网段 -> 对端），逗号分隔，格式 x.x.x.x/mask,gateway，
-     * 例如 192.168.0.0/24,10.26.0.3 */
+    /* 可选：入站路由（本端网段 -> 对端），单条格式 x.x.x.x/mask,gateway，
+     * 多条之间用 `;` 或换行分隔，也兼容直接用逗号连续书写，
+     * 例如 192.168.0.0/24,10.26.0.3
+     *      192.168.0.0/24,10.26.0.3;172.16.0.0/16,10.26.0.4 */
     const char *in_ips;
     /* 可选：出站路由，逗号分隔，格式 x.x.x.x/mask，默认 0.0.0.0/0 */
     const char *out_ips;
@@ -130,6 +134,16 @@ void vnt_set_log_callback(vnt_log_cb cb, void *ctx);
 /* 启动 vnt；成功返回句柄，失败返回 NULL，错误见 vnt_last_error */
 VntHandle *vnt_start(const VntConfig *cfg);
 
+/* 启动 vnt，并附加端口映射规则（VntConfig 布局保持不变）
+ * mapping: 多条规则用逗号/分号/空格分隔，单条格式与 CLI --mapping 一致：
+ *     tcp:127.0.0.1:80-10.26.0.10:8080
+ *     udp:0.0.0.0:53-10.26.0.5:53
+ *   格式为 协议:本机监听地址-目标地址:端口；
+ *   语义：在本机监听地址上监听，连接转发到目标地址
+ *         （目标可以是 VNT 网络内的虚拟 IP，也可以是本机路由可达的设备）
+ * mapping 传 NULL 或空串时等价于 vnt_start；失败返回 NULL，错误见 vnt_last_error */
+VntHandle *vnt_start_with_port_mapping(const VntConfig *cfg, const char *mapping);
+
 /* 停止并回收读线程；返回 0 成功，-1 句柄无效 */
 int vnt_stop(VntHandle *handle);
 
@@ -140,11 +154,42 @@ void vnt_free(VntHandle *handle);
 int vnt_is_running(VntHandle *handle);
 
 /* 运行状态 JSON：{"virtual_ip":..,"netmask":..,"gateway":..,"server":..,
- *                "online":true,"running":true,"up_stream":0,"down_stream":0} */
+ *                "online":true,"running":true,
+ *                "channel":"p2p","relay":false,"p2p_peers":1,"relay_peers":0,
+ *                "delay":12,"up_stream":0,"down_stream":0}
+ * channel    : 本机通道汇总，p2p(全部点对点) / relay(全部中继) / mixed(部分中继) / none(无在线对端)
+ * relay      : 当前是否有流量走服务端或客户端中继
+ * p2p_peers  : 点对点通道的对端数
+ * relay_peers: 中继通道的对端数
+ * delay      : 已测得通道的平均往返时延（毫秒），未测得为 -1 */
 char *vnt_status_json(VntHandle *handle);
 
-/* 设备列表 JSON：[{"ip":..,"name":..,"online":true,"wireguard":false}] */
+/* 设备列表 JSON：[{"ip":..,"name":..,"online":true,"wireguard":false,"channel":"p2p","delay":12}]
+ * channel : p2p / tcp-p2p / server-relay / client-relay
+ * delay   : 该对端的往返时延（毫秒），未测得为 -1 */
 char *vnt_device_list_json(VntHandle *handle);
+
+/* 设备详情 JSON：在设备列表基础上附带每个对端的 NAT 信息
+ * [{"ip":..,"name":..,"online":true,"wireguard":false,"channel":"p2p","delay":12,
+ *   "nat_type":"Cone","local_ipv4":"192.168.1.5","public_ips":["1.2.3.4"],"ipv6":null}]
+ * 字段除以下三项外均与 vnt_device_list_json 相同：
+ * nat_type  : 对端 NAT 类型（Symmetric / Cone）；无对端 NAT 信息时为空字符串
+ * local_ipv4: 对端本地 ipv4，未获取到为 null
+ * public_ips: 对端公网出口 IP 列表，未获取到为 []
+ * ipv6      : 对端 ipv6，未获取到为 null
+ * 注意：NAT 字段仅在设备在线且已测得 NAT 信息时有效 */
+char *vnt_device_detail_json(VntHandle *handle);
+
+/* 路由表 JSON（对应 CLI 的 route）：
+ * [{"destination":"10.26.0.3","next_hop":"10.26.0.1","metric":1,"rtt":12,
+ *   "protocol":"UDP","interface":"192.168.1.5:35535"}]
+ * destination: 目标虚拟 IP
+ * next_hop   : 下一跳虚拟 IP，解析不到为空串
+ * metric     : 跳数，1 表示直连
+ * rtt        : 往返时延（毫秒），未测得为 -1
+ * protocol   : 传输协议（UDP/TCP/WS/WSS）
+ * interface  : 承载通道，UDP 为本地地址、TCP 为 tcp@地址、WS/WSS 为服务端地址 */
+char *vnt_route_table_json(VntHandle *handle);
 
 /* 已发送字节数 */
 unsigned long long vnt_up_stream(VntHandle *handle);
